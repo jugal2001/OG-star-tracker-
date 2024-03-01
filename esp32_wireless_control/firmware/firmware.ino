@@ -9,7 +9,7 @@
 // Set your Wi-Fi credentials
 const byte DNS_PORT = 53;
 const char* ssid = "OG Star Tracker";  //change to your SSID
-const char* password = "jugal2001";    //change to your password, must be 8+ characters
+const char* password = "password123";    //change to your password, must be 8+ characters
 //If you are using AP mode, you can access the website using the below URL
 const String website_name = "www.tracker.com";
 const int dither_intensity = 5;
