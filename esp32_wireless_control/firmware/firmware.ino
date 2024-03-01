@@ -3,15 +3,16 @@
 #include <DNSServer.h>
 #include <string.h>
 #include <esp_wifi.h>
+#include <EEPROM.h>
 #include "config.h"
 
 // Set your Wi-Fi credentials
 const byte DNS_PORT = 53;
-const char* ssid = "OG Star Tracker";      //change to your SSID
-const char* password = "";        //change to your password, must be 8+ characters
+const char* ssid = "OG Star Tracker";  //change to your SSID
+const char* password = "jugal2001";    //change to your password, must be 8+ characters
 //If you are using AP mode, you can access the website using the below URL
 const String website_name = "www.tracker.com";
-
+const int dither_intensity = 5;
 //Time b/w two rising edges should be 133.3333 ms
 //66.666x2  ms
 //sidereal rate = 0.00416 deg/s
@@ -19,22 +20,32 @@ const String website_name = "www.tracker.com";
 #ifdef STEPPER_0_9
 const uint64_t c_SIDEREAL_PERIOD = 2666666;
 const uint32_t c_SLEW_SPEED = SLEW_SPEED;
-//const uint64_t c_SIDEREAL_PERIOD = 12500;
+const int arcsec_per_step = 2;
 #else
 const uint64_t c_SIDEREAL_PERIOD = 5333333;
 const uint32_t c_SLEW_SPEED = SLEW_SPEED / 2;
+const int arcsec_per_step = 4;
 #endif
 
-int slew_speed = 0, num_exp = 0, len_exp = 0;
+int slew_speed = 0, num_exp = 0, len_exp = 0, dither_on = 0, focal_length = 0, pixel_size = 0, steps_per_10pixels = 0;
+float arcsec_per_pixel = 0.0;
 unsigned long old_millis = 0, blink_millis = 0;
 uint64_t exposure_delay = 0;
 
 //state variables
-bool s_slew_active = false, s_sidereal_active = true;  //change sidereal state to false if you want tracker to be OFF on power-up
+bool s_slew_active = false, s_sidereal_active = false;  //change sidereal state to false if you want tracker to be OFF on power-up
 enum interv_states { ACTIVE,
                      DELAY,
+                     DITHER,
                      INACTIVE };
-enum interv_states s_interv = INACTIVE;
+volatile enum interv_states s_interv = INACTIVE;
+
+//2 bytes occupied by each int
+//eeprom addresses
+#define DITHER_ADDR 1
+#define FOCAL_LEN_ADDR 3
+#define PIXEL_SIZE_ADDR 5
+#define DITHER_PIXELS 30  //how many pixels to dither
 
 WebServer server(80);
 DNSServer dnsServer;
@@ -43,33 +54,165 @@ hw_timer_t* timer1 = NULL;  //for intervalometer control
 
 void IRAM_ATTR timer0_ISR() {
   //sidereal ISR
-  digitalWrite(AXIS1_STEP, !digitalRead(AXIS1_STEP));  //toggle step pin
+  digitalWrite(AXIS1_STEP, !digitalRead(AXIS1_STEP));  //toggle step pin at required frequency
 }
 
 void IRAM_ATTR timer1_ISR() {
   //intervalometer ISR
-  if (s_interv == DELAY) {
-    timerWrite(timer1, 0);
-    digitalWrite(INTERV_PIN, HIGH);
-    s_interv = ACTIVE;
-  } else if (s_interv == ACTIVE) {
+  if (s_interv == ACTIVE) {
     num_exp--;
-    if (num_exp == 0) {
+    if (num_exp % 3 == 0)  //once in every 3 images
+    {
+      s_interv = DITHER;
+      digitalWrite(INTERV_PIN, LOW);  //stop capture
+      timerStop(timer1);              //pause the timer, wait for dither to finish in main loop
+    } else if (num_exp == 0) {
       disableIntervalometer();
+      num_exp = 0;
+      len_exp = 0;
     } else {
       timerWrite(timer1, exposure_delay);
       digitalWrite(INTERV_PIN, LOW);
       s_interv = DELAY;
     }
+  } else if (s_interv == DELAY) {
+    timerWrite(timer1, 0);
+    digitalWrite(INTERV_PIN, HIGH);
+    s_interv = ACTIVE;
   }
 }
 
+const String html =
+  "<!DOCTYPE html>\n"
+  "<html>\n"
+  "<head>\n"
+  "    <title>OG Star Tracker Control</title>\n"
+  "    <meta name='viewport' content='width=device-width, initial-scale=1'>\n"
+  "    <style>\n"
+  "        body {\n"
+  "            background-color: lightcoral;\n"
+  "            text-align: center;\n"
+  "            font-family: \"Arial\";\n"
+  "        }\n"
+  "\n"
+  "        button {\n"
+  "            background-color: white;\n"
+  "            color: black;\n"
+  "            border: none;\n"
+  "            padding: 15px 32px;\n"
+  "            text-align: center;\n"
+  "            text-decoration: none;\n"
+  "            display: inline-block;\n"
+  "            font-size: 16px;\n"
+  "            margin: 4px 2px;\n"
+  "            cursor: pointer;\n"
+  "        }\n"
+  "\n"
+  "        select {\n"
+  "            font-size: 16px;\n"
+  "            padding: 5px;\n"
+  "        }\n"
+  "\n"
+  "        input[type='number'] {\n"
+  "            font-size: 16px;\n"
+  "            padding: 5px;\n"
+  "            width: 50%;\n"
+  "        }\n"
+  "\n"
+  "        label {\n"
+  "            display: inline-block;\n"
+  "            text-align: left;\n"
+  "            margin: 10px;\n"
+  "            font-size: 20px;\n"
+  "        }\n"
+  "\n"
+  "        #status {\n"
+  "            font-size: 24px;\n"
+  "            margin: 20px;\n"
+  "        }\n"
+  "    </style>\n"
+  "    <script>\n"
+  "        function sendRequest(url) {\n"
+  "            var xhr = new XMLHttpRequest();\n"
+  "            xhr.onreadystatechange = function() {\n"
+  "                if (this.readyState == 4 && this.status == 200) {\n"
+  "                    document.getElementById('status').innerHTML = this.responseText;\n"
+  "                }\n"
+  "            };\n"
+  "            xhr.open('GET', url, true);\n"
+  "            xhr.send();\n"
+  "        }\n"
+  "\n"
+  "        setInterval(function() {\n"
+  "            sendRequest('/status');\n"
+  "        }, 20000);\n"
+  "\n"
+  "        function sendSlewRequest(url) {\n"
+  "            var speed = document.getElementById('slew-select').value;\n"
+  "            var slewurl = url + '?speed=' + speed;\n"
+  "            sendRequest(slewurl);\n"
+  "        }\n"
+  "\n"
+  "        function sendCaptureRequest() {\n"
+  "            var exposure = document.getElementById('exposure').value.trim();\n"
+  "            var numExposures = document.getElementById('num-exposures').value.trim();\n"
+  "            var focalLength = document.getElementById('focal_len').value.trim();\n"
+  "            var pixSize = Math.floor(parseFloat(document.getElementById('pixel_size').value.trim()) * 100);\n"
+  "            \n"
+  "            var ditherEnabled = document.getElementById('dither_on').checked ? 1 : 0;\n"
+  "            var intervalometerUrl = '/start?exposure=' + exposure + '&numExposures=' + numExposures + '&focalLength=' + focalLength + '&pixSize=' + pixSize + '&ditherEnabled=' + ditherEnabled;\n"
+  "            sendRequest(intervalometerUrl);\n"
+  "        }\n"
+  "    </script>\n"
+  "</head>\n"
+  "<body>\n"
+  "  <h1>OG Star Tracker Control</h1>\n"
+  "    \n"
+  "    <label>Sidereal Tracking:</label><br>\n"
+  "    <button onclick=\"sendRequest('/on')\">ON</button>\n"
+  "    <button onclick=\"sendRequest('/off')\">OFF</button><br>\n"
+  "    <label>Slew Control:</label><br>\n"
+  "    <label>Speed:</label>\n"
+  "    <select id='slew-select'>\n"
+  "        <option value='1'>1</option>\n"
+  "        <option value='2'>2</option>\n"
+  "        <option value='3'>3</option>\n"
+  "        <option value='4'>4</option>\n"
+  "        <option value='5'>5</option>\n"
+  "    </select><br>\n"
+  "    <button onclick=\"sendSlewRequest('/left')\">&#8592;</button>\n"
+  "    <button onclick=\"sendSlewRequest('/right')\">&#8594;</button><br>\n"
+  "    <label>Intervalometer Control:</label><br>\n"
+  "    <input type='number' id='exposure' placeholder='Exposure length (s)'>\n"
+  "    <input type='number' id='num-exposures' placeholder='Number of Exposures'><br><br>\n"
+  "    <details>\n"
+  "        <summary>Dither Settings</summary>\n"
+  "        <!-- Content inside the collapsible section -->\n"
+  "                <label style=\"font-size: 100%\">Dithering Enable:</label>\n"
+  "                <input type=\"checkbox\" id=\"dither_on\" %dither%>\n"
+  "            </label>\n"
+  "            <div class=\"number-container\">\n"
+  "                <input type=\"number\" id=\"focal_len\" placeholder='Focal Length (mm)' value='%focallen%'>\n"
+  "                <label style=\"font-size: 80%\" for=\"focal_len\" class=\"number-label\">Ex. 135</label>\n"
+  "                <input type=\"number\" id=\"pixel_size\" placeholder='Pixel Size (um)' value='%pixsize%' step=\"0.01\">\n"
+  "                <label style=\"font-size: 80%\" for=\"pixel_size\" class=\"number-label\">Ex. 3.91</label>\n"
+  "            </div>\n"
+  "    </details><br>\n"
+  "    <button onclick=\"sendCaptureRequest()\">Start capture</button>\n"
+  "    <button onclick=\"sendRequest('/abort')\">Abort capture</button><br>\n"
+  "    <label>STATUS:</label><br>\n"
+  "    <p id='status'></p>\n"
+  "</body>\n"
+  "</html>";
+
 // Handle requests to the root URL ("/")
 void handleRoot() {
-  String html = "<!DOCTYPE html><html><head><title>OG Star Tracker Control</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{background-color: lightcoral; text-align: center;}button{background-color: white; color: black; border: none; padding: 15px 32px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer;}select{font-size: 16px; padding: 5px;}input[type='number']{font-size: 16px; padding: 5px; width: 50%;}label{display: inline-block; text-align: left; margin: 10px; font-size: 20px;}#status{font-size: 24px; margin: 20px;}</style><script>function sendRequest(url) {var xhr = new XMLHttpRequest();xhr.onreadystatechange = function() {if (this.readyState == 4 && this.status == 200) {document.getElementById('status').innerHTML = this.responseText;}};xhr.open('GET', url, true);xhr.send();}setInterval(function(){sendRequest('/status');}, 20000);function sendSlewRequest(url) {var speed = document.getElementById('slew-select').value;var slewurl = url + '?speed=' + speed;sendRequest(slewurl);}function sendCaptureRequest() {var exposure = document.getElementById('exposure').value.trim();var numExposures = document.getElementById('num-exposures').value.trim();var intervalometerUrl = '/start?exposure=' + exposure + '&numExposures=' + numExposures;sendRequest(intervalometerUrl);} </script></head><body><h1>OG Star Tracker Control</h1><label>Sidereal Tracking:</label><br><button onclick=\"sendRequest('/on')\">ON</button><button onclick=\"sendRequest('/off')\">OFF</button><br><label>Slew Control:</label><br><label>Speed:</label><select id='slew-select'><option value='1'>1</option><option value='2'>2</option><option value='3'>3</option><option value='4'>4</option><option value='5'>5</option></select><br><button onclick=\"sendSlewRequest('/left')\">&#8592;</button><button onclick=\"sendSlewRequest('/right')\">&#8594;</button><br><label>Intervalometer Control:</label><br><input type='number' id='exposure' placeholder='Exposure length (s)'><input type='number' id='num-exposures' placeholder='Number of Exposures'><br><button onclick=\"sendCaptureRequest()\">Start capture</button><button onclick=\"sendRequest('/abort')\">Abort capture</button><br><label>STATUS:</label><br><p id='status'></p></body></html>";
-  server.send(200, "text/html", html);
+  String formattedHtmlPage = String(html);
+  formattedHtmlPage.replace("%dither%", (dither_on ? "checked" : ""));
+  formattedHtmlPage.replace("%focallen%", String(focal_length).c_str());
+  formattedHtmlPage.replace("%pixsize%", String((float)pixel_size / 100, 2).c_str());
+  server.send(200, "text/html", formattedHtmlPage);
 }
-
 
 void handleOn() {
   s_sidereal_active = true;
@@ -107,10 +250,23 @@ void handleStartCapture() {
   if (s_interv == INACTIVE) {
     len_exp = server.arg("exposure").toInt();
     num_exp = server.arg("numExposures").toInt();
-    if (len_exp == 0 || num_exp == 0) {
-      server.send(200, "text/plain", "Invalid Settings");
+    dither_on = server.arg("ditherEnabled").toInt();
+    focal_length = server.arg("focalLength").toInt();
+    pixel_size = server.arg("pixSize").toInt();
+
+    if ((len_exp == 0 || num_exp == 0)) {
+      server.send(200, "text/plain", "Invalid Intervalometer Settings!");
+      return;
+    } else if (dither_on && (focal_length == 0 || pixel_size == 0)) {
+      server.send(200, "text/plain", "Invalid Dither Settings!");
       return;
     }
+    updateEEPROM(dither_on, focal_length, pixel_size);
+    arcsec_per_pixel = (((float)pixel_size / 100.0) / focal_length) * 206.265;        //div pixel size by 100 since we multiplied it by 100 in html page
+    steps_per_10pixels = (int)(((arcsec_per_pixel * 10.0) / arcsec_per_step) + 0.5);  //add 0.5 to round up float to nearest int while casting
+    Serial.println("steps per 10px: ");
+    Serial.println(steps_per_10pixels);
+
     s_interv = ACTIVE;
     exposure_delay = ((len_exp - 3) * 2000);  // 3 sec delay
     initIntervalometer();
@@ -125,6 +281,9 @@ void handleAbortCapture() {
     server.send(200, "text/plain", "Capture Already OFF");
   } else {
     disableIntervalometer();
+    num_exp = 0;
+    len_exp = 0;
+    s_interv = INACTIVE;
     server.send(200, "text/plain", "Capture OFF");
   }
 }
@@ -138,6 +297,34 @@ void handleStatusRequest() {
     server.send(204, "text/plain", "dummy");
 }
 
+void writeEEPROM(int address, int value) {
+  byte high = value >> 8;
+  byte low = value & 0xFF;
+  EEPROM.write(address, high);
+  EEPROM.write(address + 1, low);
+}
+
+int readEEPROM(int address) {
+  byte high = EEPROM.read(address);
+  byte low = EEPROM.read(address + 1);
+  return ((high << 8) + low);
+}
+
+void updateEEPROM(int dither, int focal_len, int pix_size) {
+  if (readEEPROM(DITHER_ADDR) != dither) {
+    writeEEPROM(DITHER_ADDR, dither);
+    //Serial.println("dither updated");
+  }
+  if (readEEPROM(FOCAL_LEN_ADDR) != focal_len) {
+    writeEEPROM(FOCAL_LEN_ADDR, focal_len);
+    //Serial.println("focal length updated");
+  }
+  if (readEEPROM(PIXEL_SIZE_ADDR) != pix_size) {
+    writeEEPROM(PIXEL_SIZE_ADDR, pix_size);
+    //Serial.println("pix size updated");
+  }
+  EEPROM.commit();
+}
 void setMicrostep(int microstep) {
   switch (microstep) {
     case 8:
@@ -178,7 +365,7 @@ void initSiderealTracking() {
 void initIntervalometer() {
   timer1 = timerBegin(1, 40000, true);
   timerAttachInterrupt(timer1, &timer1_ISR, true);
-  timerAlarmWrite(timer1, (len_exp * 2000), true);
+  timerAlarmWrite(timer1, (len_exp * 2000), true);  //2000 because prescaler cant be more than 16bit, = 1sec ISR freq
   timerAlarmEnable(timer1);
   digitalWrite(INTERV_PIN, HIGH);  // start the first capture
 }
@@ -187,13 +374,37 @@ void disableIntervalometer() {
   timerAlarmDisable(timer1);
   timerDetachInterrupt(timer1);
   timerEnd(timer1);
-  num_exp = 0;
-  len_exp = 0;
-  s_interv = INACTIVE;
 }
-void setup() {
 
+void ditherRoutine() {
+
+  int i = 0, j = 0;
+  timerAlarmDisable(timer0);
+  digitalWrite(AXIS1_DIR, random(2));  //dither in a random direction
+  delay(500);
+  Serial.println("Dither rndm direction:");
+  Serial.println(random(2));
+
+  for (i = 0; i < dither_intensity; i++) {
+    for (j = 0; j < steps_per_10pixels; j++) {
+      digitalWrite(AXIS1_STEP, !digitalRead(AXIS1_STEP));
+      delay(10);
+      digitalWrite(AXIS1_STEP, !digitalRead(AXIS1_STEP));
+      delay(10);
+    }
+  }
+  delay(1000);
+  initSiderealTracking();
+  delay(3000);  //settling time after dither
+}
+
+void setup() {
   Serial.begin(115200);
+  EEPROM.begin(512);  //SIZE = 6 bytes, 2 bytes for each variable
+  //fetch values from EEPROM
+  dither_on = readEEPROM(DITHER_ADDR);
+  focal_length = readEEPROM(FOCAL_LEN_ADDR);
+  pixel_size = readEEPROM(PIXEL_SIZE_ADDR);
 
 #ifdef AP
   WiFi.mode(WIFI_MODE_AP);
@@ -279,7 +490,12 @@ void loop() {
     pinMode(AXIS1_STEP, OUTPUT);
     initSiderealTracking();
   }
-
+  if (s_interv == DITHER) {
+    disableIntervalometer();
+    ditherRoutine();
+    s_interv = ACTIVE;
+    initIntervalometer();
+  }
   server.handleClient();
   dnsServer.processNextRequest();
 }
